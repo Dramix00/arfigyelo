@@ -8,7 +8,7 @@ import time
 import os
 
 # --- KONFIGURÁCIÓ ---
-st.set_page_config(page_title="Profi Piacfigyelő", layout="wide")
+st.set_page_config(page_title="Okos Piacfigyelő", layout="wide")
 
 DATA_FILE = "price_history.csv"
 ITEMS_FILE = "monitored_items.txt"
@@ -28,79 +28,96 @@ def save_monitored_item(item):
 
 def load_price_history():
     if os.path.exists(DATA_FILE):
-        df = pd.read_csv(DATA_FILE)
-        df['datum'] = pd.to_datetime(df['datum'])
-        return df
+        try:
+            df = pd.read_csv(DATA_FILE)
+            df['datum'] = pd.to_datetime(df['datum'])
+            return df
+        except:
+            return pd.DataFrame(columns=['datum', 'termek', 'ar', 'forras', 'link'])
     return pd.DataFrame(columns=['datum', 'termek', 'ar', 'forras', 'link'])
 
-# --- VALUTAVÁLTÓ (Élő árfolyam) ---
-@st.cache_data(ttl=3600) # Óránként frissíti csak az árfolyamot
+@st.cache_data(ttl=3600)
 def get_eur_huf():
     try:
-        # Ingyenes, regisztráció nélküli API
-        response = requests.get("https://open.er-api.com/v6/latest/EUR")
-        data = response.json()
-        return data['rates']['HUF']
+        response = requests.get("https://open.er-api.com/v6/latest/EUR", timeout=5)
+        return response.json()['rates']['HUF']
     except:
-        return 400.0  # Tartalék, ha az API nem elérhető
+        return 400.0
 
-# --- KERESŐ MOTOROK ---
+# --- KERESŐ MOTOROK (JAVÍTOTT) ---
+
+def get_headers():
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Accept-Language": "hu-HU,hu;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.google.com/"
+    }
+
 def search_jofogas(keyword):
     try:
         url = f"https://www.jofogas.hu/magyarorszag?q={keyword.replace(' ', '+')}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        response = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.content, 'html.parser')
+        response = requests.get(url, headers=get_headers(), timeout=15)
         
-        item = soup.find('div', class_='list-item')
+        if response.status_code != 200:
+            return None, f"Hiba: {response.status_code}"
+            
+        soup = BeautifulSoup(response.content, 'html.parser')
+        # Megpróbáljuk több szelektorral is
+        item = soup.select_one(".list-item") or soup.select_one(".item")
+        
         if item:
-            link = item.find('a', class_='item-title')['href']
-            price_text = item.find('span', class_='price-value').text
-            price = int(''.join(filter(str.isdigit, price_text)))
-            return price, link
-    except:
-        pass
-    return None, None
+            link = item.find('a', href=True)['href']
+            price_tag = item.select_one(".price-value")
+            if price_tag:
+                price = int(''.join(filter(str.isdigit, price_tag.text)))
+                return price, link
+        return None, "Nem található termék"
+    except Exception as e:
+        return None, str(e)
 
 def search_ebay(keyword, eur_rate):
     try:
-        # eBay Németország (Európai piac)
-        url = f"https://www.ebay.de/sch/i.html?_nkw={keyword.replace(' ', '+')}&_sop=15" # _sop=15 a legolcsóbb
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.content, 'html.parser')
+        url = f"https://www.ebay.de/sch/i.html?_nkw={keyword.replace(' ', '+')}&_sop=15"
+        response = requests.get(url, headers=get_headers(), timeout=15)
         
-        # Az első valid termék keresése
-        items = soup.find_all('div', class_='s-item__info')
-        for item in items[1:]: # Az első elem sokszor reklám
-            price_tag = item.find('span', class_='s-item__price')
-            link_tag = item.find('a', class_='s-item__link')
+        if response.status_code != 200:
+            return None, "Blokkolva"
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+        items = soup.select(".s-item__info")
+        
+        for item in items[1:]: # Az első elem gyakran hibás az eBay-en
+            price_tag = item.select_one(".s-item__price")
+            link_tag = item.select_one(".s-item__link")
+            
             if price_tag and link_tag:
-                # EUR tisztítása (pl. "12,99 EUR")
-                price_raw = price_tag.text.replace('EUR', '').replace(' ', '').replace('.', '').replace(',', '.')
-                # Csak az első számot vesszük ki, ha ár-tartomány van (pl. 10 - 20 EUR)
-                price_eur = float(''.join(c for c in price_raw.split('bis')[0] if c.isdigit() or c == '.'))
-                return int(price_eur * eur_rate), link_tag['href']
+                price_text = price_tag.text.split('bis')[0] # Ha ársáv van
+                price_num = ''.join(c for c in price_text if c.isdigit() or c in ',.')
+                price_num = price_num.replace(',', '.')
+                
+                if price_num:
+                    price_eur = float(price_num)
+                    return int(price_eur * eur_rate), link_tag['href']
+        return None, "Nincs találat"
     except:
-        pass
-    return None, None
+        return None, "Hiba"
 
 # --- UI ---
-st.title("🔍 Okos Piacfigyelő & Ár-összehasonlító")
+st.title("🔍 Profi Piacfigyelő")
 
 eur_huf = get_eur_huf()
-st.info(f"Aktuális árfolyam: **1 EUR = {eur_huf:.2f} HUF**")
+st.sidebar.info(f"Árfolyam: 1 EUR = {eur_huf:.2f} HUF")
 
-# Inicializálás
-if 'items' not in st.session_state:
+# Adatok betöltése
+if 'monitored_items' not in st.session_state:
     st.session_state.monitored_items = load_monitored_items()
 if 'history' not in st.session_state:
     st.session_state.history = load_price_history()
 
 # OLDALSÁV
 with st.sidebar:
-    st.header("Figyelt termékek")
-    new_item = st.text_input("Új termék neve:", placeholder="Pl. RTX 3060ti")
+    st.header("Beállítások")
+    new_item = st.text_input("Új termék:", placeholder="Pl. iPhone 13")
     if st.button("Hozzáadás"):
         if new_item and new_item not in st.session_state.monitored_items:
             save_monitored_item(new_item)
@@ -108,68 +125,73 @@ with st.sidebar:
             st.rerun()
 
     st.write("---")
-    for m_item in st.session_state.monitored_items:
-        st.write(f"📌 {m_item}")
+    st.write("Figyelt listád:")
+    for m in st.session_state.monitored_items:
+        st.caption(f"• {m}")
     
-    if st.button("Lista ürítése", type="secondary"):
+    if st.button("Összes törlése"):
         if os.path.exists(ITEMS_FILE): os.remove(ITEMS_FILE)
+        if os.path.exists(DATA_FILE): os.remove(DATA_FILE)
         st.session_state.monitored_items = []
+        st.session_state.history = pd.DataFrame(columns=['datum', 'termek', 'ar', 'forras', 'link'])
         st.rerun()
 
 # FŐPANEL
 if not st.session_state.monitored_items:
-    st.warning("Még nem adtál hozzá terméket az oldalsávon!")
+    st.info("Adj hozzá egy terméket a bal oldalon a kezdéshez!")
 else:
-    if st.button("🚀 ÖSSZES TERMÉK FRISSÍTÉSE", type="primary"):
+    if st.button("🚀 ÁRAK FRISSÍTÉSE", type="primary"):
         new_records = []
+        status_box = st.empty()
         progress_bar = st.progress(0)
         
         for idx, t in enumerate(st.session_state.monitored_items):
-            # Jófogás
-            ar_jo, link_jo = search_jofogas(t)
-            if ar_jo:
-                new_records.append({'datum': datetime.now(), 'termek': t, 'ar': ar_jo, 'forras': 'Jófogás', 'link': link_jo})
+            status_box.text(f"Keresés: {t}...")
             
-            # eBay
-            ar_eb, link_eb = search_ebay(t, eur_huf)
+            # Jófogás lekérés
+            ar_jo, info_jo = search_jofogas(t)
+            if ar_jo:
+                new_records.append({'datum': datetime.now(), 'termek': t, 'ar': ar_jo, 'forras': 'Jófogás', 'link': info_jo})
+            else:
+                st.warning(f"Jófogás ({t}): {info_jo}")
+            
+            # eBay lekérés
+            ar_eb, info_eb = search_ebay(t, eur_huf)
             if ar_eb:
-                new_records.append({'datum': datetime.now(), 'termek': t, 'ar': ar_eb, 'forras': 'eBay (EUR)', 'link': link_eb})
+                new_records.append({'datum': datetime.now(), 'termek': t, 'ar': ar_eb, 'forras': 'eBay (EUR)', 'link': info_eb})
+            else:
+                st.warning(f"eBay ({t}): {info_eb}")
             
             progress_bar.progress((idx + 1) / len(st.session_state.monitored_items))
-            time.sleep(1) # Etikus scraping
+            time.sleep(2) # Kicsit több szünet a tiltás elkerülésére
             
         if new_records:
             new_df = pd.DataFrame(new_records)
             st.session_state.history = pd.concat([st.session_state.history, new_df], ignore_index=True)
             st.session_state.history.to_csv(DATA_FILE, index=False)
-            st.success("Adatok frissítve!")
+            st.success(f"Sikeresen frissítve {len(new_records)} új adatpont!")
+            status_box.empty()
             st.rerun()
+        else:
+            st.error("Egyetlen oldalon sem sikerült árat találni. Lehet, hogy a robotvédelmet nem sikerült megkerülni.")
 
-# ADATOK MEGJELENÍTÉSE
+# MEGJELENÍTÉS
 if not st.session_state.history.empty:
-    # Grafikon választó
-    target = st.selectbox("Melyik termék grafikonját nézzük?", st.session_state.monitored_items)
-    plot_df = st.session_state.history[st.session_state.history['termek'] == target]
+    tab1, tab2 = st.tabs(["📈 Grafikon", "📋 Adatok és Linkek"])
     
-    if not plot_df.empty:
-        fig = px.line(plot_df, x='datum', y='ar', color='forras', markers=True,
-                      title=f"{target} árváltozása (HUF)")
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Táblázat linkekkel
-    st.subheader("Aktuális találatok és linkek")
+    with tab1:
+        target = st.selectbox("Termék kiválasztása:", st.session_state.monitored_items)
+        plot_df = st.session_state.history[st.session_state.history['termek'] == target]
+        if not plot_df.empty:
+            fig = px.line(plot_df, x='datum', y='ar', color='forras', markers=True, title=f"{target} árfolyam")
+            st.plotly_chart(fig, use_container_width=True)
     
-    # Formázzuk a táblázatot, hogy a linkek kattinthatóak legyenek
-    display_df = st.session_state.history.sort_values(by='datum', ascending=False).copy()
-    
-    # Streamlit oszlop konfiguráció a linkekhez
-    st.dataframe(
-        display_df,
-        column_config={
-            "link": st.column_config.LinkColumn("Hirdetés megnyitása"),
-            "ar": st.column_config.NumberColumn("Ár (HUF)", format="%d Ft"),
-            "datum": st.column_config.DatetimeColumn("Dátum")
-        },
-        use_container_width=True,
-        hide_index=True
-    )
+    with tab2:
+        st.dataframe(
+            st.session_state.history.sort_values(by='datum', ascending=False),
+            column_config={
+                "link": st.column_config.LinkColumn("Hirdetés"),
+                "ar": st.column_config.NumberColumn("Ár", format="%d Ft")
+            },
+            use_container_width=True
+        )
